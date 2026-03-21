@@ -6,12 +6,21 @@
 # This work is licensed under the terms of the MIT license.
 # For a copy, see <https://opensource.org/licenses/MIT>.
 
-"""Example script to generate traffic in the simulation"""
+"""CARLA simulation script for generating pose estimation training data."""
 
+import argparse
+import copy
 import glob
+import logging
 import os
+import queue
 import sys
 import time
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+from numpy import random
 
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
@@ -21,25 +30,115 @@ try:
 except IndexError:
     pass
 
-OUT_DIR= ""
-# sys.path.append("/opt/carla-simulator/PythonAPI/examples")
 sys.path.append("../")
-from draw_skeleton import get_screen_points, draw_skeleton, draw_points_on_buffer
+from draw_skeleton import (get_screen_points, draw_skeleton,
+                           draw_points_on_buffer)
 
 import carla
-
 from carla import VehicleLightState as vls
 
-import argparse
-import logging
-from numpy import random
-import cv2
+# Constants
+OUT_DIR = ""
+KEYPOINTS = [
+    "crl_Head__C", "crl_eye__R", "crl_eye__L", "crl_shoulder__R",
+    "crl_shoulder__L", "crl_arm__R", "crl_arm__L", "crl_foreArm__R",
+    "crl_foreArm__L", "crl_hips__C", "crl_thigh__R", "crl_thigh__L",
+    "crl_leg__R", "crl_leg__L", "crl_foot__R", "crl_foot__L"
+]
+NUM_KEYPOINTS = len(KEYPOINTS)
+BBOX_PADDING = 0.1
+WEATHER_RESET_INTERVAL = 300  # 5 minutes in seconds
 
-import numpy as np
-import queue
-import copy
 
-def getCamXforms(map_name):
+def check_keypoint_visibility(
+    point_2d: Tuple[float, float],
+    image_w: int,
+    image_h: int
+) -> int:
+    """Check keypoint visibility based on image bounds.
+    
+    Args:
+        point_2d: 2D point coordinates (x, y)
+        image_w: Image width in pixels
+        image_h: Image height in pixels
+    
+    Returns:
+        Visibility flag: 0 (not visible), 2 (visible)
+        Note: Occlusion detection (flag 1) requires depth/semantic data
+    """
+    x, y = point_2d
+    
+    # Check if point is within image boundaries
+    if 0 <= x < image_w and 0 <= y < image_h:
+        return 2  # Visible
+    return 0  # Not visible (out of bounds)
+
+
+def compute_bbox_from_keypoints(
+    keypoints: np.ndarray,
+    visibility: np.ndarray,
+    image_w: int,
+    image_h: int,
+    padding: float = BBOX_PADDING
+) -> Optional[Tuple[float, float, float, float]]:
+    """Compute normalized bounding box from visible keypoints.
+    
+    Args:
+        keypoints: Array of shape (N, 2) with keypoint coordinates
+        visibility: Array of shape (N,) with visibility flags
+        image_w: Image width in pixels
+        image_h: Image height in pixels
+        padding: Padding ratio to add around bounding box (default 0.1)
+    
+    Returns:
+        Tuple of (x_center, y_center, width, height) normalized to [0, 1]
+        Returns None if no visible keypoints
+    """
+    # Filter visible keypoints only
+    visible_mask = visibility > 0
+    if not np.any(visible_mask):
+        return None
+    
+    visible_kps = keypoints[visible_mask]
+    
+    # Calculate min/max bounds
+    x_min = np.min(visible_kps[:, 0])
+    x_max = np.max(visible_kps[:, 0])
+    y_min = np.min(visible_kps[:, 1])
+    y_max = np.max(visible_kps[:, 1])
+    
+    # Add padding
+    width = x_max - x_min
+    height = y_max - y_min
+    x_min = max(0, x_min - width * padding)
+    x_max = min(image_w, x_max + width * padding)
+    y_min = max(0, y_min - height * padding)
+    y_max = min(image_h, y_max + height * padding)
+    
+    # Calculate center and dimensions
+    bbox_width = x_max - x_min
+    bbox_height = y_max - y_min
+    x_center = x_min + bbox_width / 2.0
+    y_center = y_min + bbox_height / 2.0
+    
+    # Normalize to [0, 1]
+    x_center_norm = x_center / image_w
+    y_center_norm = y_center / image_h
+    width_norm = bbox_width / image_w
+    height_norm = bbox_height / image_h
+    
+    return (x_center_norm, y_center_norm, width_norm, height_norm)
+
+
+def getCamXforms(map_name: str) -> Tuple[carla.Location, carla.Rotation]:
+    """Get camera transform (location and rotation) for a given map.
+    
+    Args:
+        map_name: Name of the CARLA map
+    
+    Returns:
+        Tuple of (Location, Rotation) for camera placement
+    """
     if map_name == 'Town03':
         return carla.Location(x=71.634972, y=-213.649551, z=0.151049) , \
             carla.Rotation(pitch=0.000000, yaw=-87.941040, roll=0.000000)
@@ -66,72 +165,151 @@ def getCamXforms(map_name):
         return  carla.Location(x=-35.280499, y=-0.017508, z=1.532597), \
                 carla.Rotation(pitch=4.182043, yaw=130.544815, roll=0.000170)
 
-KEYPOINTS= ["crl_Head__C", "crl_eye__R", "crl_eye__L", "crl_shoulder__R", "crl_shoulder__L", \
-            "crl_arm__R", "crl_arm__L", "crl_foreArm__R", "crl_foreArm__L", \
-             "crl_hips__C", "crl_thigh__R", "crl_thigh__L", \
-             "crl_leg__R", "crl_leg__L",  "crl_foot__R", "crl_foot__L"   ]
 
-def GenerateGTPose(image,image_h,image_w, K,camera, peds):
-    buf= np.zeros((image_h, image_w, 3), dtype=np.uint8)
-
-    num_peds= 0
-    kp_structs= []
+def GenerateGTPose(
+    image,
+    image_h: int,
+    image_w: int,
+    K: np.ndarray,
+    camera,
+    peds: List
+) -> None:
+    """Generate ground truth pose annotations in YOLO-pose format.
+    
+    Processes pedestrians and outputs:
+    - Visualization image with skeleton overlay (GT folder)
+    - YOLO-pose format TXT annotations (Annot folder)
+    
+    YOLO-pose format per line:
+    <class> <x_center> <y_center> <width> <height> 
+    <kp1_x> <kp1_y> <kp1_vis> ... <kp16_x> <kp16_y> <kp16_vis>
+    
+    All coordinates normalized to [0, 1].
+    """
+    buf = np.zeros((image_h, image_w, 3), dtype=np.uint8)
+    yolo_annotations = []
+    
     for ped in peds:
-        dist = ped.get_transform().location.distance(camera.get_transform().location)
-        if dist < 50.0:            
-            try:
-                forward_vec = camera.get_transform().get_forward_vector()
-                ray = ped.get_transform().location - camera.get_transform().location
-
-                if forward_vec.dot(ray) > 0:
-                    bones= ped.get_bones()
-                    boneIndex = { x.name:i for i,x in enumerate(bones.bone_transforms)  }          
-                    points= [x.world.location for x in bones.bone_transforms]   
-
-                    points2d = get_screen_points(camera, K, image_w, image_h, points)                    
-
-                    locs= np.array( [ points2d[boneIndex[x]] for x in KEYPOINTS ])
-                    if np.any(locs<0):
-                        # print("NEG")
-                        continue
-                    
-                    draw_skeleton(buf, image_w, image_h, boneIndex, points2d, (0, 255, 0), 3)
-                    kp_structs.append(locs)
-                    num_peds += 1
-
-
-            except Exception as E:
-                print(E)
+        try:
+            dist = ped.get_transform().location.distance(
+                camera.get_transform().location
+            )
+            if dist >= 50.0:
+                continue
+            
+            forward_vec = camera.get_transform().get_forward_vector()
+            ray = ped.get_transform().location - \
+                  camera.get_transform().location
+            
+            if forward_vec.dot(ray) <= 0:
+                continue
+            
+            bones = ped.get_bones()
+            bone_index = {
+                x.name: i for i, x in enumerate(bones.bone_transforms)
+            }
+            points = [x.world.location for x in bones.bone_transforms]
+            points2d = get_screen_points(
+                camera, K, image_w, image_h, points
+            )
+            
+            # Extract keypoint locations for the 16 defined keypoints
+            keypoint_coords = np.array([
+                points2d[bone_index[kp_name]] for kp_name in KEYPOINTS
+            ])
+            
+            # Compute visibility for each keypoint
+            visibility = np.array([
+                check_keypoint_visibility(kp, image_w, image_h)
+                for kp in keypoint_coords
+            ])
+            
+            # Skip if no visible keypoints
+            if not np.any(visibility > 0):
+                continue
+            
+            # Compute bounding box from visible keypoints
+            bbox = compute_bbox_from_keypoints(
+                keypoint_coords, visibility, image_w, image_h
+            )
+            
+            if bbox is None:
+                continue
+            
+            # Normalize keypoint coordinates to [0, 1]
+            kp_normalized = keypoint_coords.copy()
+            kp_normalized[:, 0] /= image_w
+            kp_normalized[:, 1] /= image_h
+            
+            # Prepare YOLO-pose annotation
+            # Format: class x_c y_c w h kp1_x kp1_y kp1_v ... kp16_x kp16_y kp16_v
+            annotation = [0] + list(bbox)  # class=0 for person
+            for i in range(NUM_KEYPOINTS):
+                annotation.extend([
+                    kp_normalized[i, 0],
+                    kp_normalized[i, 1],
+                    visibility[i]
+                ])
+            
+            yolo_annotations.append(annotation)
+            
+            # Draw skeleton on visualization buffer
+            draw_skeleton(
+                buf, image_w, image_h, bone_index, points2d,
+                (0, 255, 0), 3
+            )
+            
+        except Exception as e:
+            logging.warning(f"Error processing pedestrian: {e}")
+    
+    # Save visualization image
     cv2.imwrite(f"{OUT_DIR}/GT/{image.frame}.png", buf)
-
-    # print(f"WROTE {image.frame}_GT.png ")
-
-    # TODO
-    # one txt file per image: <class_idx> <px1> <py1> <px2> <py2> .... <pxn> <pyn> per line
     
-    with open(f"{OUT_DIR}/Annot/{image.frame}.txt",'w') as F:        
-        for person in kp_structs:
-            F.write(f"0 ")
-            for pnt in person: 
-                F.write(f"{int(pnt[0])} {int(pnt[1])} ")
-            F.write("\n")
+    # Write YOLO-pose format annotations
+    with open(f"{OUT_DIR}/Annot/{image.frame}.txt", 'w') as f:
+        for annotation in yolo_annotations:
+            # Write class, bbox, and keypoints
+            class_id = int(annotation[0])
+            bbox_vals = annotation[1:5]
+            kp_vals = annotation[5:]
+            
+            f.write(f"{class_id} ")
+            f.write(" ".join(f"{v:.6f}" for v in bbox_vals))
+            f.write(" ")
+            f.write(" ".join(
+                f"{kp_vals[i*3]:.6f} {kp_vals[i*3+1]:.6f} {int(kp_vals[i*3+2])}"
+                for i in range(NUM_KEYPOINTS)
+            ))
+            f.write("\n") 
+
+
+
+def ProcessDVSImage(image) -> None:
+    """Process and save DVS (Dynamic Vision Sensor) image data.
     
-    # change keypoint format to COCO-pose and 
-
-
-
-def ProcessDVSImage(image):
+    Args:
+        image: CARLA DVS sensor image with raw event data
+    """
     dvs_events = np.frombuffer(image.raw_data, dtype=np.dtype([
-            ('x', np.uint16), ('y', np.uint16), ('t', np.int64), ('pol', np.bool)]))     
+            ('x', np.uint16), ('y', np.uint16), ('t', np.int64),
+            ('pol', np.bool)]))
 
     dvs_img = np.zeros((image.height, image.width, 3), dtype=np.uint8)
-    dvs_img[dvs_events[:]['y'], dvs_events[:]['x'], dvs_events[:]['pol'] * 2] = 255   
+    dvs_img[
+        dvs_events[:]['y'], dvs_events[:]['x'], dvs_events[:]['pol'] * 2
+    ] = 255
     array2 = copy.deepcopy(dvs_img)
 
     cv2.imwrite(f"{OUT_DIR}/events/{image.frame}.png", array2)
     print(f"{OUT_DIR}/events/{image.frame}.png")
 
-def ProcessRGBImage(image):
+
+def ProcessRGBImage(image) -> None:
+    """Process and save RGB camera image.
+    
+    Args:
+        image: CARLA RGB sensor image with raw pixel data
+    """
     array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
     array = np.reshape(array, (image.height, image.width, 4))
     array = array[:, :, :3]
@@ -140,7 +318,17 @@ def ProcessRGBImage(image):
     array2 = copy.deepcopy(array)
     cv2.imwrite(f"{OUT_DIR}/RGB/{image.frame}_RGB.png", array2)
 
-def build_projection_matrix(w, h, fov):
+def build_projection_matrix(w: int, h: int, fov: float) -> np.ndarray:
+    """Build camera projection matrix from intrinsic parameters.
+    
+    Args:
+        w: Image width in pixels
+        h: Image height in pixels
+        fov: Field of view in degrees
+    
+    Returns:
+        3x3 camera intrinsic matrix K
+    """
     focal = w / (2.0 * np.tan(fov * np.pi / 360.0))
     K = np.identity(3)
     K[0, 0] = K[1, 1] = focal
@@ -148,7 +336,451 @@ def build_projection_matrix(w, h, fov):
     K[1, 2] = h / 2.0
     return K
 
-def get_actor_blueprints(world, filter, generation):
+
+def generate_random_weather() -> carla.WeatherParameters:
+    """Generate random weather from predefined templates with variations.
+    
+    Randomly selects from weather templates and adds parameter variations
+    to create diverse weather conditions for training data.
+    
+    Returns:
+        carla.WeatherParameters with randomized weather settings
+    """
+    # Define weather templates
+    weather_templates = {
+        'sunny': {
+            'cloudiness': 10.0,
+            'precipitation': 0.0,
+            'precipitation_deposits': 0.0,
+            'sun_altitude_angle': 45.0,
+            'sun_azimuth_angle': 90.0,
+            'wind_intensity': 5.0,
+            'fog_density': 0.0,
+            'wetness': 0.0,
+        },
+        'cloudy': {
+            'cloudiness': 60.0,
+            'precipitation': 0.0,
+            'precipitation_deposits': 0.0,
+            'sun_altitude_angle': 30.0,
+            'sun_azimuth_angle': 90.0,
+            'wind_intensity': 10.0,
+            'fog_density': 5.0,
+            'wetness': 0.0,
+        },
+        'rainy': {
+            'cloudiness': 90.0,
+            'precipitation': 70.0,
+            'precipitation_deposits': 70.0,
+            'sun_altitude_angle': 10.0,
+            'sun_azimuth_angle': 90.0,
+            'wind_intensity': 30.0,
+            'fog_density': 10.0,
+            'wetness': 70.0,
+        },
+        'foggy': {
+            'cloudiness': 30.0,
+            'precipitation': 0.0,
+            'precipitation_deposits': 0.0,
+            'sun_altitude_angle': 10.0,
+            'sun_azimuth_angle': 90.0,
+            'wind_intensity': 0.0,
+            'fog_density': 40.0,
+            'wetness': 0.0,
+        },
+        'twilight': {
+            'cloudiness': 0.0,
+            'precipitation': 0.0,
+            'precipitation_deposits': 0.0,
+            'sun_altitude_angle': 5.0,
+            'sun_azimuth_angle': 30.0,
+            'wind_intensity': 0.0,
+            'fog_density': 0.0,
+            'wetness': 0.0,
+        },
+        'night': {
+            'cloudiness': 20.0,
+            'precipitation': 0.0,
+            'precipitation_deposits': 0.0,
+            'sun_altitude_angle': -20.0,
+            'sun_azimuth_angle': 90.0,
+            'wind_intensity': 5.0,
+            'fog_density': 0.0,
+            'wetness': 0.0,
+        },
+        'storm': {
+            'cloudiness': 100.0,
+            'precipitation': 90.0,
+            'precipitation_deposits': 80.0,
+            'sun_altitude_angle': 5.0,
+            'sun_azimuth_angle': 90.0,
+            'wind_intensity': 80.0,
+            'fog_density': 20.0,
+            'wetness': 90.0,
+        },
+    }
+    
+    # Randomly select a template
+    template_name = random.choice(list(weather_templates.keys()))
+    template = weather_templates[template_name].copy()
+    
+    # Add random variations (±20% for most parameters)
+    variations = {
+        'cloudiness': 0.2,
+        'precipitation': 0.15,
+        'precipitation_deposits': 0.15,
+        'sun_altitude_angle': 15.0,  # ±15 degrees
+        'sun_azimuth_angle': 30.0,   # ±30 degrees
+        'wind_intensity': 0.2,
+        'fog_density': 0.15,
+        'wetness': 0.15,
+    }
+    
+    for param, base_value in template.items():
+        if param in variations:
+            if param in ['sun_altitude_angle', 'sun_azimuth_angle']:
+                # Additive variation for angles
+                variation = random.uniform(
+                    -variations[param], variations[param]
+                )
+            else:
+                # Multiplicative variation for other params
+                variation = random.uniform(
+                    1.0 - variations[param], 1.0 + variations[param]
+                )
+                variation = base_value * variation - base_value
+            
+            template[param] = base_value + variation
+    
+    # Clamp values to valid CARLA ranges
+    template['cloudiness'] = np.clip(template['cloudiness'], 0.0, 100.0)
+    template['precipitation'] = np.clip(template['precipitation'], 0.0, 100.0)
+    template['precipitation_deposits'] = np.clip(
+        template['precipitation_deposits'], 0.0, 100.0
+    )
+    template['sun_altitude_angle'] = np.clip(
+        template['sun_altitude_angle'], -90.0, 90.0
+    )
+    template['sun_azimuth_angle'] = np.clip(
+        template['sun_azimuth_angle'], 0.0, 360.0
+    )
+    template['wind_intensity'] = np.clip(template['wind_intensity'], 0.0, 100.0)
+    template['fog_density'] = np.clip(template['fog_density'], 0.0, 100.0)
+    template['wetness'] = np.clip(template['wetness'], 0.0, 100.0)
+    
+    logging.info(f"Generated {template_name} weather with variations")
+    
+    return carla.WeatherParameters(**template)
+
+
+def spawn_vehicles(
+    world,
+    client,
+    args,
+    blueprints: List,
+    spawn_points: List,
+    traffic_manager,
+    synchronous_master: bool
+) -> List[int]:
+    """Spawn vehicles in the simulation world.
+    
+    Args:
+        world: CARLA world object
+        client: CARLA client
+        args: Command line arguments
+        blueprints: List of vehicle blueprints
+        spawn_points: List of spawn point transforms
+        traffic_manager: Traffic manager instance
+        synchronous_master: Whether running in synchronous mode
+    
+    Returns:
+        List of spawned vehicle actor IDs
+    """
+    SpawnActor = carla.command.SpawnActor
+    SetAutopilot = carla.command.SetAutopilot
+    FutureActor = carla.command.FutureActor
+    
+    batch = []
+    hero = args.hero
+    
+    for n, transform in enumerate(spawn_points):
+        if n >= args.number_of_vehicles:
+            break
+        
+        blueprint = random.choice(blueprints)
+        
+        if blueprint.has_attribute('color'):
+            color = random.choice(
+                blueprint.get_attribute('color').recommended_values
+            )
+            blueprint.set_attribute('color', color)
+        
+        if blueprint.has_attribute('driver_id'):
+            driver_id = random.choice(
+                blueprint.get_attribute('driver_id').recommended_values
+            )
+            blueprint.set_attribute('driver_id', driver_id)
+        
+        if hero:
+            blueprint.set_attribute('role_name', 'hero')
+            hero = False
+        else:
+            blueprint.set_attribute('role_name', 'autopilot')
+        
+        batch.append(
+            SpawnActor(blueprint, transform).then(
+                SetAutopilot(FutureActor, True, traffic_manager.get_port())
+            )
+        )
+    
+    vehicles_list = []
+    for response in client.apply_batch_sync(batch, synchronous_master):
+        if response.error:
+            logging.error(f"Vehicle spawn error: {response.error}")
+        else:
+            vehicles_list.append(response.actor_id)
+    
+    # Set automatic vehicle lights if specified
+    if args.car_lights_on:
+        all_vehicle_actors = world.get_actors(vehicles_list)
+        for actor in all_vehicle_actors:
+            traffic_manager.update_vehicle_lights(actor, True)
+    
+    logging.info(f"Spawned {len(vehicles_list)} vehicles")
+    return vehicles_list
+
+
+def spawn_walkers(
+    world,
+    client,
+    args,
+    blueprints: List
+) -> Tuple[List[Dict], List[int]]:
+    """Spawn pedestrians in the simulation world.
+    
+    Args:
+        world: CARLA world object
+        client: CARLA client
+        args: Command line arguments
+        blueprints: List of walker blueprints
+    
+    Returns:
+        Tuple of (walkers_list, all_id) where walkers_list contains
+        walker dictionaries with 'id' and 'con' keys, and all_id
+        is a flat list of all controller and walker IDs
+    """
+    SpawnActor = carla.command.SpawnActor
+    
+    percentagePedestriansRunning = 0.0
+    percentagePedestriansCrossing = 0.0
+    
+    if args.seedw:
+        world.set_pedestrians_seed(args.seedw)
+        random.seed(args.seedw)
+    
+    # Generate spawn points
+    spawn_points = []
+    for i in range(args.number_of_walkers):
+        spawn_point = carla.Transform()
+        loc = world.get_random_location_from_navigation()
+        if loc is not None:
+            spawn_point.location = loc
+            spawn_points.append(spawn_point)
+    
+    # Spawn walker actors
+    batch = []
+    walker_speed = []
+    for spawn_point in spawn_points:
+        walker_bp = random.choice(blueprints)
+        
+        if walker_bp.has_attribute('is_invincible'):
+            walker_bp.set_attribute('is_invincible', 'false')
+        
+        if walker_bp.has_attribute('speed'):
+            if random.random() > percentagePedestriansRunning:
+                walker_speed.append(
+                    walker_bp.get_attribute('speed').recommended_values[1]
+                )
+            else:
+                walker_speed.append(
+                    walker_bp.get_attribute('speed').recommended_values[2]
+                )
+        else:
+            walker_speed.append(0.0)
+        
+        batch.append(SpawnActor(walker_bp, spawn_point))
+    
+    results = client.apply_batch_sync(batch, True)
+    walkers_list = []
+    walker_speed2 = []
+    
+    for i in range(len(results)):
+        if results[i].error:
+            logging.error(f"Walker spawn error: {results[i].error}")
+        else:
+            walkers_list.append({"id": results[i].actor_id})
+            walker_speed2.append(walker_speed[i])
+    
+    walker_speed = walker_speed2
+    
+    # Spawn walker controllers
+    batch = []
+    walker_controller_bp = world.get_blueprint_library().find(
+        'controller.ai.walker'
+    )
+    for i in range(len(walkers_list)):
+        batch.append(
+            SpawnActor(
+                walker_controller_bp, carla.Transform(), walkers_list[i]["id"]
+            )
+        )
+    
+    results = client.apply_batch_sync(batch, True)
+    for i in range(len(results)):
+        if results[i].error:
+            logging.error(f"Controller spawn error: {results[i].error}")
+        else:
+            walkers_list[i]["con"] = results[i].actor_id
+    
+    # Build all_id list
+    all_id = []
+    for walker in walkers_list:
+        all_id.append(walker["con"])
+        all_id.append(walker["id"])
+    
+    # Initialize walker controllers
+    all_actors = world.get_actors(all_id)
+    world.set_pedestrians_cross_factor(percentagePedestriansCrossing)
+    
+    for i in range(0, len(all_id), 2):
+        all_actors[i].start()
+        all_actors[i].go_to_location(
+            world.get_random_location_from_navigation()
+        )
+        all_actors[i].set_max_speed(float(walker_speed[int(i/2)]))
+    
+    logging.info(f"Spawned {len(walkers_list)} walkers")
+    return walkers_list, all_id
+
+
+def spawn_cameras(
+    world,
+    map_name: str
+) -> Tuple:
+    """Spawn DVS and RGB cameras at predefined locations.
+    
+    Args:
+        world: CARLA world object
+        map_name: Name of the map for camera positioning
+    
+    Returns:
+        Tuple of (camera_dvs, camera_rgb, image_queue, rgb_image_queue,
+                  image_w, image_h, fov, K)
+    """
+    # DVS camera
+    camera_bp = world.get_blueprint_library().find('sensor.camera.dvs')
+    camera_bp.set_attribute('positive_threshold', '0.7')
+    camera_bp.set_attribute('negative_threshold', '0.7')
+    camera_bp.set_attribute('sigma_positive_threshold', '0.7')
+    camera_bp.set_attribute('sigma_negative_threshold', '0.7')
+    camera_bp.set_attribute('refractory_period_ns', '330000')
+    
+    camera_dvs = world.spawn_actor(camera_bp, carla.Transform())
+    cam_loc, cam_rot = getCamXforms(map_name)
+    camera_dvs.set_transform(
+        carla.Transform(location=cam_loc, rotation=cam_rot)
+    )
+    
+    image_queue = queue.Queue()
+    camera_dvs.listen(image_queue.put)
+    
+    image_w = camera_bp.get_attribute("image_size_x").as_int()
+    image_h = camera_bp.get_attribute("image_size_y").as_int()
+    fov = camera_bp.get_attribute("fov").as_float()
+    K = build_projection_matrix(image_w, image_h, fov)
+    
+    # RGB camera
+    camera_rgb_bp = world.get_blueprint_library().find('sensor.camera.rgb')
+    camera_rgb = world.spawn_actor(camera_rgb_bp, carla.Transform())
+    camera_rgb.set_transform(
+        carla.Transform(location=cam_loc, rotation=cam_rot)
+    )
+    
+    rgb_image_queue = queue.Queue()
+    camera_rgb.listen(rgb_image_queue.put)
+    
+    # Move spectator for debugging
+    spectator = world.get_spectator()
+    spectator.set_transform(
+        carla.Transform(location=cam_loc, rotation=cam_rot)
+    )
+    
+    logging.info(f"Spawned cameras at {map_name} location")
+    return (camera_dvs, camera_rgb, image_queue, rgb_image_queue,
+            image_w, image_h, fov, K)
+
+
+def destroy_actors(
+    client,
+    world,
+    vehicles_list: List[int],
+    all_id: List[int],
+    cameras: List
+) -> None:
+    """Destroy all actors in the simulation.
+    
+    Args:
+        client: CARLA client
+        world: CARLA world
+        vehicles_list: List of vehicle actor IDs
+        all_id: List of all walker and controller IDs
+        cameras: List of camera actors to destroy
+    """
+    # Stop walker controllers
+    if all_id:
+        all_actors = world.get_actors(all_id)
+        for i in range(0, len(all_id), 2):
+            try:
+                all_actors[i].stop()
+            except Exception as e:
+                logging.warning(f"Error stopping walker controller: {e}")
+    
+    # Destroy vehicles
+    if vehicles_list:
+        logging.info(f'Destroying {len(vehicles_list)} vehicles')
+        client.apply_batch(
+            [carla.command.DestroyActor(x) for x in vehicles_list]
+        )
+    
+    # Destroy walkers
+    if all_id:
+        logging.info(f'Destroying {len(all_id)//2} walkers')
+        client.apply_batch(
+            [carla.command.DestroyActor(x) for x in all_id]
+        )
+    
+    # Destroy cameras
+    for camera in cameras:
+        if camera is not None:
+            try:
+                camera.destroy()
+            except Exception as e:
+                logging.warning(f"Error destroying camera: {e}")
+    
+    logging.info("All actors destroyed")
+
+
+def get_actor_blueprints(world, filter: str, generation: str) -> List:
+    """Get actor blueprints filtered by type and generation.
+    
+    Args:
+        world: CARLA world object
+        filter: Blueprint filter string (e.g., 'vehicle.*')
+        generation: Generation filter ('1', '2', or 'all')
+    
+    Returns:
+        List of filtered actor blueprints
+    """
     bps = world.get_blueprint_library().filter(filter)
 
     if generation.lower() == "all":
@@ -172,7 +804,13 @@ def get_actor_blueprints(world, filter, generation):
         print("   Warning! Actor Generation is not valid. No actor will be spawned.")
         return []
 
-def main():
+def main() -> None:
+    """Main function to run CARLA simulation with pose estimation data generation.
+    
+    Spawns vehicles and pedestrians in CARLA, captures DVS and RGB images,
+    generates ground truth pose annotations in YOLO format, and resets
+    the simulation every 5 minutes with new random weather.
+    """
     argparser = argparse.ArgumentParser(
         description=__doc__)
 
@@ -272,73 +910,34 @@ def main():
         action='store_true',
         default=False,
         help='Activate no rendering mode')
+    argparser.add_argument(
+        '--out-dir',        
+        help='Output directory')
 
     args = argparser.parse_args()
 
     global OUT_DIR
-    MAP_NAME= 'Town10HD'
-    print(MAP_NAME)
-    OUT_DIR= f"/home/local/ASUAD/kchanda3/carlaScripts/{MAP_NAME}"
-    os.system(f"mkdir -p {OUT_DIR}")
+    MAP_NAME = 'Town10HD'
+    logging.info(f"Using map: {MAP_NAME}")
+    assert args.out_dir is not None, "Please specify an output directory"
+    OUT_DIR = f"{args.out_dir}/{MAP_NAME}"
+    # OUT_DIR = f"/home/local/ASUAD/kchanda3/carlaScripts/{MAP_NAME}"
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-    for dirname in ['events','RGB','GT', 'Annot']:
-        os.system(f"mkdir -p {OUT_DIR}/{dirname}")
+    for dirname in ['events', 'RGB', 'GT', 'Annot']:
+        os.makedirs(f"{OUT_DIR}/{dirname}", exist_ok=True)
 
-    os.system(f"rm {OUT_DIR}/events/*")
-    os.system(f"rm {OUT_DIR}/RGB/*")
-    os.system(f"rm {OUT_DIR}/GT/*")
+    # Clean up old data
+    for dirname in ['events', 'RGB', 'GT']:
+        for file in glob.glob(f"{OUT_DIR}/{dirname}/*"):
+            try:
+                os.remove(file)
+            except Exception as e:
+                logging.warning(f"Could not remove {file}: {e}")
 
-    # RAINY
-    weather_rainy = carla.WeatherParameters(
-        cloudiness=1.0,
-        precipitation=70.0,
-        precipitation_deposits=70.0,
-        sun_altitude_angle=10.0,
-        sun_azimuth_angle = 90.0,        
-        wind_intensity = 0.0,
-        fog_density = 0.5,
-        wetness = 70.0,
-    )            
-
-    # FOGGY
-    weather_foggy = carla.WeatherParameters(
-        cloudiness= 30.0,
-        precipitation=00.0,
-        precipitation_deposits=0.0,
-        sun_altitude_angle=10.0,
-        sun_azimuth_angle = 90.0,        
-        wind_intensity = 0.0,
-        fog_density = 40.0,
-        wetness = 0.0,
+    logging.basicConfig(
+        format='%(levelname)s: %(message)s', level=logging.INFO
     )
-
-    # TWILIGHT
-    weather_twilight = carla.WeatherParameters(
-        cloudiness= 0.0,
-        precipitation=0.0,
-        precipitation_deposits=0.0,
-        sun_altitude_angle=10.0,
-        sun_azimuth_angle = 30.0,        
-        wind_intensity = 0.0,
-        fog_density = 0.0,
-        wetness = 0.0,
-    )
-
-    # NIGHT
-    weather_twilight = carla.WeatherParameters(
-        cloudiness= 0.0,
-        precipitation=0.0,
-        precipitation_deposits=0.0,
-        sun_altitude_angle= -10.0,
-        sun_azimuth_angle = 90.0,        
-        wind_intensity = 0.0,
-        fog_density = 0.0,
-        wetness = 0.0,
-    )
-
-
-
-    logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.INFO)
 
     vehicles_list = []
     walkers_list = []
@@ -407,186 +1006,112 @@ def main():
             logging.warning(msg, args.number_of_vehicles, number_of_spawn_points)
             args.number_of_vehicles = number_of_spawn_points
 
-        # @todo cannot import these directly.
-        SpawnActor = carla.command.SpawnActor
-        SetAutopilot = carla.command.SetAutopilot
-        FutureActor = carla.command.FutureActor
-
-        # --------------
-        # Spawn vehicles
-        # --------------
-        batch = []
-        hero = args.hero
-        for n, transform in enumerate(spawn_points):
-            if n >= args.number_of_vehicles:
-                break
-            blueprint = random.choice(blueprints)
-            if blueprint.has_attribute('color'):
-                color = random.choice(blueprint.get_attribute('color').recommended_values)
-                blueprint.set_attribute('color', color)
-            if blueprint.has_attribute('driver_id'):
-                driver_id = random.choice(blueprint.get_attribute('driver_id').recommended_values)
-                blueprint.set_attribute('driver_id', driver_id)
-            if hero:
-                blueprint.set_attribute('role_name', 'hero')
-                hero = False
-            else:
-                blueprint.set_attribute('role_name', 'autopilot')
-
-            # spawn the cars and set their autopilot and light state all together
-            batch.append(SpawnActor(blueprint, transform)
-                .then(SetAutopilot(FutureActor, True, traffic_manager.get_port())))
-
-        for response in client.apply_batch_sync(batch, synchronous_master):
-            if response.error:
-                logging.error(response.error)
-            else:
-                vehicles_list.append(response.actor_id)
-
-        # Set automatic vehicle lights update if specified
-        if args.car_lights_on:
-            all_vehicle_actors = world.get_actors(vehicles_list)
-            for actor in all_vehicle_actors:
-                traffic_manager.update_vehicle_lights(actor, True)
-
-        # -------------
-        # Spawn Walkers
-        # -------------
-        # some settings
-        percentagePedestriansRunning = 0.0      # how many pedestrians will run
-        percentagePedestriansCrossing = 0.0     # how many pedestrians will walk through the road
-        if args.seedw:
-            world.set_pedestrians_seed(args.seedw)
-            random.seed(args.seedw)
-        # 1. take all the random locations to spawn
-        spawn_points = []
-        for i in range(args.number_of_walkers):
-            spawn_point = carla.Transform()
-            loc = world.get_random_location_from_navigation()
-            if (loc != None):
-                spawn_point.location = loc
-                spawn_points.append(spawn_point)
-        # 2. we spawn the walker object
-        batch = []
-        walker_speed = []
-        for spawn_point in spawn_points:
-            walker_bp = random.choice(blueprintsWalkers)
-            # set as not invincible
-            if walker_bp.has_attribute('is_invincible'):
-                walker_bp.set_attribute('is_invincible', 'false')
-            # set the max speed
-            if walker_bp.has_attribute('speed'):
-                if (random.random() > percentagePedestriansRunning):
-                    # walking
-                    walker_speed.append(walker_bp.get_attribute('speed').recommended_values[1])
-                else:
-                    # running
-                    walker_speed.append(walker_bp.get_attribute('speed').recommended_values[2])
-            else:
-                print("Walker has no speed")
-                walker_speed.append(0.0)
-            batch.append(SpawnActor(walker_bp, spawn_point))
-        results = client.apply_batch_sync(batch, True)
-        walker_speed2 = []
-        for i in range(len(results)):
-            if results[i].error:
-                logging.error(results[i].error)
-            else:
-                walkers_list.append({"id": results[i].actor_id})
-                walker_speed2.append(walker_speed[i])
-        walker_speed = walker_speed2
-        # 3. we spawn the walker controller
-        batch = []
-        walker_controller_bp = world.get_blueprint_library().find('controller.ai.walker')
-        for i in range(len(walkers_list)):
-            batch.append(SpawnActor(walker_controller_bp, carla.Transform(), walkers_list[i]["id"]))
-        results = client.apply_batch_sync(batch, True)
-        for i in range(len(results)):
-            if results[i].error:
-                logging.error(results[i].error)
-            else:
-                walkers_list[i]["con"] = results[i].actor_id
-        # 4. we put together the walkers and controllers id to get the objects from their id
-        for i in range(len(walkers_list)):
-            all_id.append(walkers_list[i]["con"])
-            all_id.append(walkers_list[i]["id"])
-        all_actors = world.get_actors(all_id)
-
-        # SPAWN DVS CAMERA
-        camera_bp = world.get_blueprint_library().find('sensor.camera.dvs')
-        camera_bp.set_attribute('positive_threshold', '0.7')
-        camera_bp.set_attribute('negative_threshold', '0.7')
-        camera_bp.set_attribute('sigma_positive_threshold', '0.7')
-        camera_bp.set_attribute('sigma_negative_threshold', '0.7')
-        camera_bp.set_attribute('refractory_period_ns', '330000')
-
-        camera = world.spawn_actor(camera_bp, carla.Transform())
+        # Initial weather setup
+        initial_weather = generate_random_weather()
+        world.set_weather(initial_weather)
         
-        # cam_loc= carla.Location(x=-35.280499, y=-0.017508, z=1.532597) 
-        # cam_rot= carla.Rotation(pitch=4.182043, yaw=130.544815, roll=0.000170)
-        cam_loc, cam_rot = getCamXforms(MAP_NAME)
-        camera.set_transform(carla.Transform(location=cam_loc, rotation=cam_rot ) )
-        image_queue = queue.Queue()
-        camera.listen(image_queue.put)
-
-        image_w = camera_bp.get_attribute("image_size_x").as_int()
-        image_h = camera_bp.get_attribute("image_size_y").as_int()
-        fov = camera_bp.get_attribute("fov").as_float()
-        K = build_projection_matrix(image_w, image_h, fov)
+        # Spawn actors using refactored functions
+        vehicles_list = spawn_vehicles(
+            world, client, args, blueprints, spawn_points,
+            traffic_manager, synchronous_master
+        )
         
-        # SPAWN RPG CAMERA
-        camera_rgb_bp = world.get_blueprint_library().find('sensor.camera.rgb')
-        camera_rgb = world.spawn_actor(camera_rgb_bp, carla.Transform())
-        camera_rgb.set_transform(carla.Transform(location=cam_loc, rotation=cam_rot ) )
-        rgb_image_queue = queue.Queue()
-        camera_rgb.listen(rgb_image_queue.put)
+        walkers_list, all_id = spawn_walkers(
+            world, client, args, blueprintsWalkers
+        )
+        
+        (camera, camera_rgb, image_queue, rgb_image_queue,
+         image_w, image_h, fov, K) = spawn_cameras(world, MAP_NAME)
+        
+        # Get pedestrian actors for pose generation
+        peds = [x for x in world.get_actors() if 'pedestrian' in x.type_id]
 
-
-        # MOVE SPECTATOR (FOR DEBUGGING)
-        spectator= world.get_spectator()
-        spectator.set_transform(carla.Transform(location=cam_loc, rotation=cam_rot ) )
-
-        peds= [x for x in world.get_actors() if 'pedestrian' in x.type_id ]
-
-        # wait for a tick to ensure client receives the last transform of the walkers we have just created
+        # Wait for a tick to ensure client receives last transforms
         if args.asynch or not synchronous_master:
             world.wait_for_tick()
         else:
             world.tick()
 
-        # 5. initialize each controller and set target to walk to (list is [controler, actor, controller, actor ...])
-        # set how many pedestrians can cross the road
-        world.set_pedestrians_cross_factor(percentagePedestriansCrossing)
-        for i in range(0, len(all_id), 2):
-            # start walker
-            all_actors[i].start()
-            # set walk to random point
-            all_actors[i].go_to_location(world.get_random_location_from_navigation())
-            # max speed
-            all_actors[i].set_max_speed(float(walker_speed[int(i/2)]))
+        print(f'Spawned {len(vehicles_list)} vehicles and '
+              f'{len(walkers_list)} walkers. Press Ctrl+C to exit.')
 
-        print('spawned %d vehicles and %d walkers, press Ctrl+C to exit.' % (len(vehicles_list), len(walkers_list)))
-
-        # Example of how to use Traffic Manager parameters
+        # Traffic Manager parameters
         traffic_manager.global_percentage_speed_difference(30.0)
 
-        num_frames= 12000
-        while num_frames>=0 :                    
+        # Initialize simulation timer for weather resets
+        simulation_start_time = time.time()
+        num_frames = 12000
+        
+        while num_frames >= 0:
+            # Check if 5 minutes have elapsed for weather reset
+            elapsed_time = time.time() - simulation_start_time
+            if elapsed_time >= WEATHER_RESET_INTERVAL:
+                logging.info(
+                    f"Resetting simulation after {elapsed_time:.1f} seconds"
+                )
+                
+                # Destroy all current actors
+                destroy_actors(
+                    client, world, vehicles_list, all_id,
+                    [camera, camera_rgb]
+                )
+                
+                # Generate new random weather
+                new_weather = generate_random_weather()
+                world.set_weather(new_weather)
+                
+                # Respawn all actors
+                vehicle_spawn_points = world.get_map().get_spawn_points()
+                random.shuffle(vehicle_spawn_points)
+                
+                vehicles_list = spawn_vehicles(
+                    world, client, args, blueprints,
+                    vehicle_spawn_points, traffic_manager,
+                    synchronous_master
+                )
+                
+                walkers_list, all_id = spawn_walkers(
+                    world, client, args, blueprintsWalkers
+                )
+                
+                (camera, camera_rgb, image_queue, rgb_image_queue,
+                 image_w, image_h, fov, K) = spawn_cameras(
+                    world, MAP_NAME
+                )
+                
+                # Update pedestrian list
+                peds = [
+                    x for x in world.get_actors()
+                    if 'pedestrian' in x.type_id
+                ]
+                
+                # Reset timer
+                simulation_start_time = time.time()
+                
+                # Wait for tick after reset
+                if args.asynch or not synchronous_master:
+                    world.wait_for_tick()
+                else:
+                    world.tick()
+                
+                logging.info("Simulation reset complete")
+            
+            # Normal simulation tick
             if not args.asynch and synchronous_master:
                 world.tick()
             else:
-                # print("Waiting for tick...")
                 world.wait_for_tick()
+            
+            # Process images and generate ground truth
             image = image_queue.get()
-            rgb_image= rgb_image_queue.get()
+            rgb_image = rgb_image_queue.get()
             ProcessDVSImage(image)
-            ProcessRGBImage(rgb_image)         
-            GenerateGTPose(image,image_h, image_w, K,camera, peds)
-            num_frames-= 1
-            # print(f"WROTE {image.frame}")
+            ProcessRGBImage(rgb_image)
+            GenerateGTPose(image, image_h, image_w, K, camera, peds)
+            num_frames -= 1
 
     finally:
-
+        # Clean up simulation settings
         if not args.asynch and synchronous_master:
             settings = world.get_settings()
             settings.synchronous_mode = False
@@ -594,17 +1119,10 @@ def main():
             settings.fixed_delta_seconds = None
             world.apply_settings(settings)
 
-        print('\ndestroying %d vehicles' % len(vehicles_list))
-        client.apply_batch([carla.command.DestroyActor(x) for x in vehicles_list])
-
-        # stop walker controllers (list is [controller, actor, controller, actor ...])
-        for i in range(0, len(all_id), 2):
-            all_actors[i].stop()
-
-        print('\ndestroying %d walkers' % len(walkers_list))
-        client.apply_batch([carla.command.DestroyActor(x) for x in all_id])
-
-        camera.destroy()
+        # Destroy all actors
+        destroy_actors(
+            client, world, vehicles_list, all_id, [camera, camera_rgb]
+        )
 
 
         time.sleep(0.5)

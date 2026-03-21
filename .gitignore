@@ -33,4 +33,7 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
-.github/
+
+# Copilot files
+.github/*
+.chats/*

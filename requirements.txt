@@ -1,0 +1,24 @@
+# Requirements for CARLA Data Generation Script
+# Compatible with CARLA 0.9.15
+
+# Core dependencies
+numpy==1.23.5
+opencv-python==4.8.1
+
+# CARLA Python API
+# Note: CARLA 0.9.15 egg file should be installed separately
+# Download from: https://github.com/carla-simulator/carla/releases/tag/0.9.15
+# The egg file is already present: carla-0.9.15-py3.7-linux-x86_64.egg
+
+# Python version requirement
+# Python 3.7+ (tested with Python 3.7-3.10)
+
+# Installation instructions:
+# 1. Install Python dependencies:
+#    pip install -r requirements.txt
+#
+# 2. CARLA egg is loaded dynamically by the script
+#    No separate installation needed if egg file is present
+#
+# 3. Run the script:
+#    python GenerateData.py --help
