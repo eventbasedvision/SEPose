@@ -23,16 +23,11 @@ import numpy as np
 from numpy import random
 
 try:
-    sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
-        sys.version_info.major,
-        sys.version_info.minor,
-        'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
-except IndexError:
-    pass
+    sys.path.append("carla-0.9.15-py3.7-linux-x86_64.egg")
+except Exception as e:    
+    print(e)
 
-sys.path.append("../")
 from draw_skeleton import get_screen_points, draw_skeleton
-
 import carla
 
 # Constants
@@ -64,7 +59,7 @@ def check_keypoint_visibility(
         Visibility flag: 0 (not visible), 2 (visible)
         Note: Occlusion detection (flag 1) requires depth/semantic data
     """
-    x, y = point_2d
+    x, y = point_2d[:2]  # points_2d includes depth as 3rd element
     
     # Check if point is within image boundaries
     if 0 <= x < image_w and 0 <= y < image_h:
@@ -136,32 +131,44 @@ def getCamXforms(map_name: str) -> Tuple[carla.Location, carla.Rotation]:
     
     Returns:
         Tuple of (Location, Rotation) for camera placement
+    
+    Raises:
+        ValueError: If map_name is not supported
     """
-    if map_name == 'Town03':
-        return carla.Location(x=71.634972, y=-213.649551, z=0.151049) , \
+    camera_transforms = {
+        'Town03': (
+            carla.Location(x=71.634972, y=-213.649551, z=0.151049),
             carla.Rotation(pitch=0.000000, yaw=-87.941040, roll=0.000000)
-
-    elif map_name== 'Town05':
-        return carla.Location(x=-175.693878, y=76.624390, z=5.408956), \
-                carla.Rotation(pitch=-16.103148, yaw=137.193390, roll=0.000127)
-
-    elif map_name==  'Town04':
-        return carla.Location(x=193.145935, y=-257.109344, z=6.300411), \
-                carla.Rotation(pitch=-30.599081, yaw=49.880680, roll=0.000091)
-
-    elif map_name== 'Town07':
-        return carla.Location(x=8.499461, y=4.675543, z=1.850266) , \
-                carla.Rotation(pitch=3.275424, yaw=-145.442154, roll=0.000480)
-    
-    elif map_name== 'Town07_Opt':
-        # return carla.Location(x=5.589095, y=6.237842, z=9.058050) , \
-        #         carla.Rotation(pitch=-39.062405, yaw=-132.940796, roll=0.000443)
-        return carla.Location(x=3.249976, y=5.709602, z=2.096144),\
+        ),
+        'Town04': (
+            carla.Location(x=193.145935, y=-257.109344, z=6.300411),
+            carla.Rotation(pitch=-30.599081, yaw=49.880680, roll=0.000091)
+        ),
+        'Town05': (
+            carla.Location(x=-175.693878, y=76.624390, z=5.408956),
+            carla.Rotation(pitch=-16.103148, yaw=137.193390, roll=0.000127)
+        ),
+        'Town07': (
+            carla.Location(x=8.499461, y=4.675543, z=1.850266),
+            carla.Rotation(pitch=3.275424, yaw=-145.442154, roll=0.000480)
+        ),
+        'Town07_Opt': (
+            carla.Location(x=3.249976, y=5.709602, z=2.096144),
             carla.Rotation(pitch=-19.308350, yaw=-141.595810, roll=0.000442)
+        ),
+        'Town10HD': (
+            carla.Location(x=-35.280499, y=-0.017508, z=1.532597),
+            carla.Rotation(pitch=4.182043, yaw=130.544815, roll=0.000170)
+        ),
+    }
     
-    elif map_name == 'Town10HD':
-        return  carla.Location(x=-35.280499, y=-0.017508, z=1.532597), \
-                carla.Rotation(pitch=4.182043, yaw=130.544815, roll=0.000170)
+    if map_name not in camera_transforms:
+        supported_maps = ', '.join(camera_transforms.keys())
+        raise ValueError(
+            f"Unsupported map: '{map_name}'. Supported maps: {supported_maps}"
+        )
+    
+    return camera_transforms[map_name]
 
 
 def GenerateGTPose(
@@ -202,6 +209,11 @@ def GenerateGTPose(
             if forward_vec.dot(ray) <= 0:
                 continue
             
+            # Get bone transforms from walker
+            # API: Walker.get_bones() returns WalkerBoneControlOut
+            # WalkerBoneControlOut.bone_transforms is list of bone_transform_out objects
+            # Each bone_transform_out has attributes: name, world, component, relative
+            # world/component/relative are Transform objects with .location attribute
             bones = ped.get_bones()
             bone_index = {
                 x.name: i for i, x in enumerate(bones.bone_transforms)
@@ -258,7 +270,7 @@ def GenerateGTPose(
             )
             
         except Exception as e:
-            logging.warning(f"Error processing pedestrian: {e}")
+            logging.warning(f"Error processing pedestrian: {e}", exc_info=True)
     
     # Save visualization image
     cv2.imwrite(f"{OUT_DIR}/GT/{image.frame}.png", buf)
@@ -290,7 +302,7 @@ def ProcessDVSImage(image) -> None:
     """
     dvs_events = np.frombuffer(image.raw_data, dtype=np.dtype([
             ('x', np.uint16), ('y', np.uint16), ('t', np.int64),
-            ('pol', np.bool)]))
+            ('pol', np.bool_)]))
 
     dvs_img = np.zeros((image.height, image.width, 3), dtype=np.uint8)
     dvs_img[
@@ -354,6 +366,7 @@ def generate_random_weather() -> carla.WeatherParameters:
             'sun_azimuth_angle': 90.0,
             'wind_intensity': 5.0,
             'fog_density': 0.0,
+            'fog_distance': 0.0,
             'wetness': 0.0,
         },
         'cloudy': {
@@ -364,6 +377,7 @@ def generate_random_weather() -> carla.WeatherParameters:
             'sun_azimuth_angle': 90.0,
             'wind_intensity': 10.0,
             'fog_density': 5.0,
+            'fog_distance': 50.0,
             'wetness': 0.0,
         },
         'rainy': {
@@ -374,6 +388,7 @@ def generate_random_weather() -> carla.WeatherParameters:
             'sun_azimuth_angle': 90.0,
             'wind_intensity': 30.0,
             'fog_density': 10.0,
+            'fog_distance': 30.0,
             'wetness': 70.0,
         },
         'foggy': {
@@ -384,6 +399,7 @@ def generate_random_weather() -> carla.WeatherParameters:
             'sun_azimuth_angle': 90.0,
             'wind_intensity': 0.0,
             'fog_density': 40.0,
+            'fog_distance': 10.0,
             'wetness': 0.0,
         },
         'twilight': {
@@ -394,6 +410,7 @@ def generate_random_weather() -> carla.WeatherParameters:
             'sun_azimuth_angle': 30.0,
             'wind_intensity': 0.0,
             'fog_density': 0.0,
+            'fog_distance': 0.0,
             'wetness': 0.0,
         },
         'night': {
@@ -404,6 +421,7 @@ def generate_random_weather() -> carla.WeatherParameters:
             'sun_azimuth_angle': 90.0,
             'wind_intensity': 5.0,
             'fog_density': 0.0,
+            'fog_distance': 0.0,
             'wetness': 0.0,
         },
         'storm': {
@@ -414,6 +432,7 @@ def generate_random_weather() -> carla.WeatherParameters:
             'sun_azimuth_angle': 90.0,
             'wind_intensity': 80.0,
             'fog_density': 20.0,
+            'fog_distance': 20.0,
             'wetness': 90.0,
         },
     }
@@ -431,6 +450,7 @@ def generate_random_weather() -> carla.WeatherParameters:
         'sun_azimuth_angle': 30.0,   # ±30 degrees
         'wind_intensity': 0.2,
         'fog_density': 0.15,
+        'fog_distance': 0.2,
         'wetness': 0.15,
     }
     
@@ -464,6 +484,7 @@ def generate_random_weather() -> carla.WeatherParameters:
     )
     template['wind_intensity'] = np.clip(template['wind_intensity'], 0.0, 100.0)
     template['fog_density'] = np.clip(template['fog_density'], 0.0, 100.0)
+    template['fog_distance'] = max(0.0, template['fog_distance'])  # 0 to infinity
     template['wetness'] = np.clip(template['wetness'], 0.0, 100.0)
     
     logging.info(f"Generated {template_name} weather with variations")
@@ -796,10 +817,16 @@ def get_actor_blueprints(world, filter: str, generation: str) -> List:
             bps = [x for x in bps if int(x.get_attribute('generation')) == int_generation]
             return bps
         else:
-            print("   Warning! Actor Generation is not valid. No actor will be spawned.")
+            logging.warning(
+                f"Actor generation '{generation}' is not valid (must be 1 or 2). "
+                "No actors will be spawned."
+            )
             return []
-    except:
-        print("   Warning! Actor Generation is not valid. No actor will be spawned.")
+    except ValueError:
+        logging.warning(
+            f"Actor generation '{generation}' is not a valid integer. "
+            "No actors will be spawned."
+        )
         return []
 
 def main() -> None:
@@ -815,7 +842,7 @@ def main() -> None:
     argparser.add_argument(
         '--host',
         metavar='H',
-        default='127.0.0.1',
+        default='localhost',
         help='IP of the host server (default: 127.0.0.1)')
     argparser.add_argument(
         '-p', '--port',
@@ -936,14 +963,15 @@ def main() -> None:
     vehicles_list = []
     walkers_list = []
     all_id = []
-    client = carla.Client(args.host, args.port)
-    client.set_timeout(10.0)
+    # client = carla.Client(args.host, args.port)
+    client = carla.Client('localhost', 2000)
+    # client.set_timeout(10.0)
     synchronous_master = False
     random.seed(args.seed if args.seed is not None else int(time.time()))
 
     try:
         
-        client.load_world(MAP_NAME)
+        # client.load_world(MAP_NAME)
         world = client.get_world()
         world.set_weather(generate_random_weather())
 

@@ -426,7 +426,3 @@ When research is complete and code is written:
 4. **Validate Solution**: Ensure code actually runs and produces expected results
 
 Remember: **Speed and reliability are everything**. The goal is production-ready code that works now, not perfect code that arrives too late.
-
-In all generated files and code, enclose math in `$...$` for inline math and `$$...$$` for display math to ensure proper formatting.
-
-Never read or write files outside of the project directory. Always assume the project directory is the root of your operations and always work within it, using relative paths. Never use absolute paths or access files outside the project directory. This is a strict rule to ensure security and maintain the integrity of the project environment.

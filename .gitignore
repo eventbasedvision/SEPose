@@ -36,3 +36,8 @@ Thumbs.db
 
 # Copilot files
 .chats/*
+.reports/*
+*.png
+
+#Dataset files
+DATA/
